@@ -17,12 +17,12 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import PoseStamped
 import tf.transformations as tf_trans
 
-import cv2
 import argparse
 import numpy as np
 import os
 import configparser
 
+sys.path.append('/home/demo/Workspace/seung/open3d_ros_helper')
 import open3d as o3d # import both o3d and pcl occurs segmentation faults
 from open3d_ros_helper.utils import *
 import copy
@@ -31,32 +31,37 @@ import tf2_ros
 import scipy as sp
 import numpy.matlib as npm
 
+import tensorflow as tf
 from auto_pose.ae import utils as u
 from auto_pose.ae import ae_factory as factory
 from auto_pose.ae.utils import get_dataset_path
 from auto_pose.meshrenderer import meshrenderer_phong
 from auto_pose.meshrenderer.pysixd import misc, visibility
 import matplotlib.pyplot as plt
-
+import torch.nn.functional as F
+from socket_utils import *
 
 class PoseEstimator:
 
     def __init__(self):
 
         # initalize node
-        rospy.init_node('part_recognition')
-        rospy.loginfo("Starting part_recognition_mpaae.py")
+        rospy.init_node('detr_mpaae')
+        rospy.loginfo("Starting detr_mpaae.py")
 
         self.params = rospy.get_param("part_recognition")
         self.is_class_names = self.params["is_class_names"]
         self.pad_factors = [1.2, 1.2, 1.2, 1.2]
         self.use_masked_crop = self.params["use_mask_crop"]
-        self.use_sameWH_crop =self.params["use_sameWHcrop"]
+        self.use_sameWH_crop = self.params["use_sameWHcrop"]
         self.pe_class_names = self.params["pe_class_names"]
+        self.labels2color = {0: 0, 1: 38, 2: 76, 3: 115, 4: 153, 5: 191}
         self.classidx2color = [[13, 128, 255], [255, 12, 12], [217, 12, 232], [232, 222, 12]]
         self.color_dict = [(255,255,0), (0,0,255), (255,0,0), (255,255,0)] * 10
         self.roi = self.params["roi"]
         self.bridge = cv_bridge.CvBridge()
+        os.environ["CUDA_VISIBLE_DEVICES"] = self.params["pe_gpu_id"]
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
         # subscribers
         self.tf_buffer = tf2_ros.Buffer(rospy.Duration(1.0))
@@ -64,15 +69,17 @@ class PoseEstimator:
         is_sucess = False
         while not is_sucess:
             try:
-                self.transform_map_to_cam = self.tf_buffer.lookup_transform(self.params["camera_frame"], "map", rospy.Time(), rospy.Duration(1.0))
+                self.transform_map_to_cam = self.tf_buffer.lookup_transform("map", self.params["camera_frame"], rospy.Time(), rospy.Duration(1.0))
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-                print(e)
                 rospy.sleep(0.5)
+            self.H_map2cam = msg_to_se3(self.transform_map_to_cam)
             is_sucess = True
-        self.initialize_is_model()
+
+        self.initialize_detr_server()
+        self.initialize_simulator_server()
         self.initialize_pose_est_model()
+
         rgb_sub = message_filters.Subscriber(self.params["rgb"], Image, buff_size=720*1280*3)
-        # rgb_rect_sub = message_filters.Subscriber(self.params["rgb_rect"], Image, buff_size=720*1280*3)
         depth_sub = message_filters.Subscriber(self.params["depth"], Image, buff_size=720*1280)
         point_sub = message_filters.Subscriber(self.params["point"], PointCloud2, buff_size=720*1280*3)
         self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub, point_sub], queue_size=1, slop=1)
@@ -93,34 +100,29 @@ class PoseEstimator:
         self.vis_cou_costmap = rospy.Publisher('/assembly/vis_cou_costmap', Image, queue_size=1)
 
 
-    def initialize_is_model(self):
-        import torch
-        import torchvision.transforms as transforms
-        # import maskrcnn from pytorch module        
-        from MaskRCNN import maskrcnn
-        # load config files
-        with open(self.params["is_config_path"]) as config_file:
-            self.config = json.load(config_file)
-        # build model
-        os.environ["CUDA_VISIBLE_DEVICES"] = self.params["is_gpu_id"]
-        self.model = maskrcnn.get_model_instance_segmentation(num_classes=5, config=self.config)
-        self.model.load_state_dict(torch.load(self.params["is_weight_path"]))
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        self.model.eval()
-        self.rgb_transform = transforms.Compose([
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
-                    ])
+    def initialize_detr_server(self):
+        
+        rospy.loginfo("Waiting for DETR client {}:{}".format(self.params["tcp_ip"], self.params["detr_tcp_port"]))
+        s_detr = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s_detr.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s_detr.bind((self.params["tcp_ip"], self.params["detr_tcp_port"]))
+        s_detr.listen(True)
+        self.detr_socket, self.detr_addr = s_detr.accept()
+        rospy.loginfo("Connected by {}:{}".format(self.params["tcp_ip"], self.params["detr_tcp_port"]))
+
+    def initialize_simulator_server(self):
+        
+        rospy.loginfo("Waiting for Simulator client {}:{}".format(self.params["tcp_ip"], self.params["sim_tcp_port"]))
+        s_sim = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s_sim.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s_sim.bind((self.params["tcp_ip"], self.params["sim_tcp_port"]))
+        s_sim.listen(True)
+        self.sim_socket, self.sim_addr = s_sim.accept()
+        rospy.loginfo("Connected by {}:{}".format(self.params["tcp_ip"], self.params["sim_tcp_port"]))
 
     def initialize_pose_est_model(self):
-        import tensorflow as tf
 
         rospy.loginfo("Loading AAE model")
-        os.environ["CUDA_VISIBLE_DEVICES"] = self.params["pe_gpu_id"]
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
         tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
         self.workspace_path = os.environ.get('AE_WORKSPACE_PATH')
         if self.workspace_path == None:
@@ -165,33 +167,73 @@ class PoseEstimator:
         checkpoint_file = u.get_checkpoint_basefilename(log_dir, False, latest=self.train_args.getint('Training', 'NUM_ITER'), joint=True)
         saver.restore(self.sess, checkpoint_file)
        
+    def gather_is_masks(self, is_masks, pred_labels):
+        # is_masks [N_detect, H, W] -> [H, W] (color with is_obj_id)
+        mask_all = np.zeros([self.params["height"], self.params["width"]])
+        for is_mask, pred_label in zip(is_masks, pred_labels):
+            mask_all[is_mask.astype(np.bool)] = self.labels2color[int(pred_label)]
+        mask_all = np.expand_dims(mask_all, -1)
+        mask_all = np.repeat(mask_all, 3, -1) 
+        return np.uint8(mask_all)
 
 
     def inference(self, rgb, depth, pcl_msg):
-        ## 1. Get rgb, depth, point cloud
+        # 1. get rgb, depth, point cloud
         start_time = time.time()
         camera_header = rgb.header
         rgb = self.bridge.imgmsg_to_cv2(rgb, desired_encoding='bgr8')
         rgb = PIL.Image.fromarray(np.uint8(rgb), mode="RGB")
         rgb_img = np.uint8(rgb.resize((self.params["width"], self.params["height"]), PIL.Image.BICUBIC))
-
-        # rgb_rect = self.bridge.imgmsg_to_cv2(rgb_rect, desired_encoding='bgr8')
-        # rgb_rect = PIL.Image.fromarray(np.uint8(rgb_rect), mode="RGB")
-        # rgb_rect_img = np.uint8(rgb_rect.resize((self.params["width"], self.params["height"]), PIL.Image.BICUBIC))
-
         depth = self.bridge.imgmsg_to_cv2(depth, desired_encoding='32FC1')
         depth = cv2.resize(depth, dsize=(self.params["width"], self.params["height"]), interpolation=cv2.INTER_AREA)
+        cloud_cam = convert_ros_to_o3d(pcl_msg, remove_nans=True) 
 
-        rgb = self.rgb_transform(rgb_img).unsqueeze(0)
-        print("-------------------------------------")
-        # print("=> Get Input \t {}".format(time.time()-start_time))
+        # 2. run DETR with client    
+        sendall_image(self.detr_socket, rgb_img)
+        pred_masks = recvall_pickle(self.detr_socket) # [n_detect, 720, 1280] probability of [0 ~ 1]
+        pred_boxes = recvall_pickle(self.detr_socket)    
+        pred_labels = recvall_pickle(self.detr_socket)    
+        pred_scores = recvall_pickle(self.detr_socket) 
 
-        ## 2. Instance Segmentation using Mask R-CNN
-        is_results = self.model(rgb.to(self.device))[0]
-        pred_masks = is_results["masks"].cpu().detach().numpy()
-        pred_boxes = is_results['boxes'].cpu().detach().numpy()
-        pred_labels = is_results['labels'].cpu().detach().numpy()
-        pred_scores = is_results['scores'].cpu().detach().numpy()
+        # 3. run mpaae for 6d pose estimation
+        boxes, scores, is_masks, all_pose_estimates, is_obj_ids = self.run_mpaae(rgb_img, pred_labels, pred_boxes, pred_scores, pred_masks)
+        # 4. pose refinement using ICP 
+        aae_pos_list, aae_quat_list, icp_pos_list, icp_quat_list = self.pose_refinement_with_icp(cloud_cam, is_masks, all_pose_estimates, is_obj_ids)
+        # 5. simulator
+        sendall_pickle(self.sim_socket, is_obj_ids)
+        sendall_pickle(self.sim_socket, icp_pos_list)
+        sendall_pickle(self.sim_socket, icp_quat_list)
+        sendall_image(self.sim_socket, rgb_img)
+        depth[depth < self.params["min_depth"]] = self.params["min_depth"]
+        depth[depth > self.params["max_depth"]] = self.params["max_depth"]
+        depth = (depth - self.params["min_depth"]) / (self.params["max_depth"] - self.params["min_depth"])
+        depth = np.uint8(255 * depth)
+        sendall_image(self.sim_socket, depth)
+        # is_mask_all = self.gather_is_masks(is_masks, pred_labels)
+        for is_mask in is_masks:
+            sendall_image(self.sim_socket, 255*is_mask)
+
+        # publish
+        camera_header.frame_id = 'base'
+        aae_detections_array = Detection3DArray()
+        aae_detections_array.header = camera_header
+        icp_detections_array = Detection3DArray()
+        icp_detections_array.header = camera_header
+        for i, is_obj_id in enumerate(is_obj_ids):
+            class_id = self.pe_class_names.index(self.is_class_names[is_obj_id])
+            aae_pose_msg, aae_detection = self.gather_pose_results(camera_header, class_id, aae_pos_list[i], aae_quat_list[i])
+            icp_pose_msg, icp_detection = self.gather_pose_results(camera_header, class_id, icp_pos_list[i], icp_quat_list[i])
+            aae_detections_array.detections.append(aae_detection)
+            icp_detections_array.detections.append(icp_detection)
+
+        self.publish_vis_is(rgb_img, is_masks, boxes, is_obj_ids, scores)
+        self.aae_detections_pub.publish(aae_detections_array)
+        self.icp_detections_pub.publish(icp_detections_array)
+        self.publish_markers(self.aae_markers_pub, aae_detections_array, [13, 255, 128])
+        self.publish_markers(self.icp_markers_pub, icp_detections_array, [128, 128, 255])
+
+
+    def run_mpaae(self, rgb_img, pred_labels, pred_boxes, pred_scores, pred_masks):
         boxes, scores, is_obj_ids, rgb_crops, is_masks = [], [], [], [], []
         for i, (label, (x1, y1, x2, y2), score, mask) in enumerate(zip(pred_labels, pred_boxes, pred_scores, pred_masks)):
             if score < self.params["is_thresh"]:
@@ -200,14 +242,18 @@ class PoseEstimator:
                 continue
             boxes.append(np.array([x1, y1, x2, y2]))
             scores.append(score)
-            label = label-1
+            label = label - 1
             is_obj_ids.append(label)
-            is_masks.append(mask[0])
+            mask[mask > self.params["seg_thresh"]] = 1
+            mask[mask < self.params["seg_thresh"]] = 0
+            mask = np.uint8(mask)
+            is_masks.append(mask)
+
             if self.use_masked_crop[label]:
-                mask[mask >= 0.5] = 1
-                mask[mask < 0.5] = 0.3
-                mask = np.repeat(mask, 3, 0)
-                mask = np.transpose(mask, (1, 2, 0))
+                mask[mask >= self.params["seg_thresh"]] = 1
+                mask[mask < self.params["seg_thresh"]] = 0.3
+                mask = np.expand_dims(mask, -1)
+                mask = np.repeat(mask, 3, 2)
                 masked_img = rgb_img * mask 
             else:
                 masked_img = rgb_img 
@@ -233,7 +279,6 @@ class PoseEstimator:
                 rgb_crop[:,(x+w-left):] = 0
             rgb_crop = cv2.resize(rgb_crop, (128, 128), interpolation=cv2.INTER_NEAREST)
             rgb_crops.append(rgb_crop)
-        # print("=> Inst Seg \t {}".format(time.time()-start_time))
 
         ## 3. 6D Object Pose Estimation using MPAAE
         if len(is_masks) == 0:
@@ -243,38 +288,31 @@ class PoseEstimator:
             box_xywh = [box[0], box[1], box[2]-box[0], box[3]-box[1]]
             H_aae = np.eye(4)
             class_idx = self.pe_class_names.index(self.is_class_names[label])
-            R_est, t_est, _ = self.codebook.auto_pose6d(self.sess, 
+            R_est, t_est, _ = self.codebook.auto_pose6d(self.sess,
                                                     rgb_crop, 
                                                     box_xywh, 
                                                     self.intrinsic_matrix, 
-                                                    1, 
+                                                    1,
                                                     self.train_args,
                                                     self.codebook._get_codebook_name(self.ply_centered_paths[class_idx]),
                                                     refine=False)
             H_aae[:3,:3] = R_est
             H_aae[:3, 3] = t_est 
-            all_pose_estimates.append(H_aae)     
-        # print("=> Pose Est \t {}".format(time.time()-start_time))
+            all_pose_estimates.append(H_aae)    
+        return boxes, scores, is_masks, all_pose_estimates, is_obj_ids 
 
-        ## 4. 6D Object Pose Refinement using ICP 
-        if "merged" in self.params["point"]:
-            cloud_map = convert_ros_to_o3d(pcl_msg) 
-            cloud_cam = do_transform_o3d_cloud(copy.deepcopy(cloud_map), self.transform_map_to_cam)
-        else:
-            cloud_cam = convert_ros_to_o3d(pcl_msg, remove_nans=True) 
 
-        aae_trans = []
-        aae_rot = []
-        icp_trans = []
-        icp_rot = []
+    def pose_refinement_with_icp(self, cloud_cam, is_masks, all_pose_estimates, is_obj_ids):
+        aae_pos_list = []
+        aae_quat_list = []
+        icp_pos_list = []
+        icp_quat_list = []
         for i, (pose_estimate, label) in enumerate(zip(all_pose_estimates, is_obj_ids)):
             # crop cloud with instance mask   
             is_mask = is_masks[i].copy()
-            is_mask[is_mask < 0.5] = 0
             cloud_cam_obj = crop_o3d_cloud_with_mask(cloud_cam, is_mask, camera_info=self.camera_info)
             pe_obj_id = self.pe_class_names.index(self.is_class_names[label])
             # cloud_cam_obj, index = cloud_cam_obj.remove_statistical_outlier(nb_neighbors = 50, std_ratio=0.2)
-            
             # transform cloud_obj to the origin of camera frame
             cloud_obj = copy.deepcopy(self.cloud_objs[pe_obj_id])
             H_obj2cam = np.eye(4)
@@ -288,61 +326,30 @@ class PoseEstimator:
             cloud_obj = cloud_obj.transform(H_aae_cam2obj)
             # translate cloud_obj to the centroid of cloud cam
             H_obj_to_cam_centroid = cloud_cam_obj.get_center() - cloud_obj.get_center()
-            # print(H_aae_cam2obj[:3, 3][2], H_obj_to_cam_centroid[2])
             H_aae_cam2obj[:3, 3] = H_aae_cam2obj[:3, 3] + H_obj_to_cam_centroid
             all_pose_estimates[i][:3, 3] = H_aae_cam2obj[:3, 3] * 1000
             cloud_obj = cloud_obj.translate(H_obj_to_cam_centroid)
-            # o3d.visualization.draw_geometries([cloud_obj, cloud_cam_obj])
-            
+            # o3d.visualization.draw_geometries([cloud_obj, cloud_cam_obj])            
             # icp refinement
             icp_result, residual = icp_refinement_with_ppf_match(cloud_obj, cloud_cam_obj, 
                                 n_points=self.params["n_points"], n_iter=self.params["n_iter"], tolerance=self.params["tolerance"], num_levels=self.params["num_levels"])
             # print("{}: \t res: {}".format(self.is_class_names[label], residual))
             if residual < 1:
-                H_refined_cam2obj = np.matmul(icp_result, H_aae_cam2obj)
+                H_icp_cam2obj = np.matmul(icp_result, H_aae_cam2obj)
             else:
-                H_refined_cam2obj = H_aae_cam2obj
+                H_icp_cam2obj = H_aae_cam2obj
 
-            all_pose_estimates[i][:3, :3] = H_refined_cam2obj[:3, :3]
-            T_centroid = np.eye(4)
-            T_centroid[:3, 3] = self.centroids[pe_obj_id]
+            # cam_to_obj -> map_to_obj
+            H_aae_map2obj = np.matmul(self.H_map2cam, H_aae_cam2obj)
+            aae_pos_list.append(H_aae_map2obj[:3, 3])
+            aae_quat_list.append(tf_trans.quaternion_from_matrix(H_aae_map2obj))
 
-            translation = H_aae_cam2obj[:3, 3] 
-            rotation = tf_trans.quaternion_from_matrix(H_aae_cam2obj)
-            aae_trans.append(translation)
-            aae_rot.append(rotation)
+            H_icp_map2obj = np.matmul(self.H_map2cam, H_icp_cam2obj)
+            icp_pos_list.append(H_icp_map2obj[:3, 3])
+            icp_quat_list.append(tf_trans.quaternion_from_matrix(H_icp_map2obj))
+        return aae_pos_list, aae_quat_list, icp_pos_list, icp_quat_list 
 
-            translation = H_refined_cam2obj[:3, 3] 
-            rotation = tf_trans.quaternion_from_matrix(H_refined_cam2obj)
-            icp_trans.append(translation)
-            icp_rot.append(rotation)
-        # print("=> ICP \t {}".format(time.time()-start_time))
-
-        # 5. calculate reprojection error (VSD) and publish the detection3D
-        pe_obj_ids, pe_masks, pe_depth = self.reproject_pe(self.pose_aae_vis_pub, all_pose_estimates, is_obj_ids, boxes, scores, rgb_img)
-        vsd_errors = self.get_vsd_error(self.vis_vsd_costmap, is_masks, is_obj_ids, depth, pe_masks, pe_obj_ids, pe_depth)
-        cou_errors = self.get_cou_error(self.vis_cou_costmap, is_masks, is_obj_ids, depth, pe_masks, pe_obj_ids, pe_depth)
-        reproj_errors = np.mean(np.vstack([vsd_errors, cou_errors]), axis=0)
-        aae_detections_array = Detection3DArray()
-        aae_detections_array.header = camera_header
-        icp_detections_array = Detection3DArray()
-        icp_detections_array.header = camera_header
-        # print("=> Get reprojErr \t {}".format(time.time()-start_time))
-        for i, is_obj_id in enumerate(is_obj_ids):
-            class_id = self.pe_class_names.index(self.is_class_names[is_obj_id])
-            aae_pose_msg, aae_detection = self.gather_pose_results(camera_header, class_id, aae_trans[i], aae_rot[i], reproj_errors[i])
-            icp_pose_msg, icp_detection = self.gather_pose_results(camera_header, class_id, icp_trans[i], icp_rot[i], reproj_errors[i])
-            aae_detections_array.detections.append(aae_detection)
-            icp_detections_array.detections.append(icp_detection)
-
-        self.publish_vis_is(rgb_img, is_masks, boxes, is_obj_ids, scores)
-        self.aae_detections_pub.publish(aae_detections_array)
-        self.icp_detections_pub.publish(icp_detections_array)
-        self.publish_markers(self.aae_markers_pub, aae_detections_array, [13, 255, 128])
-        self.publish_markers(self.icp_markers_pub, icp_detections_array, [128, 128, 255])
-
-
-    def gather_pose_results(self, header, class_id, translation, rotation, score):
+    def gather_pose_results(self, header, class_id, translation, rotation):
         
         pose_msg = PoseStamped()
         pose_msg.header = header
@@ -359,7 +366,7 @@ class PoseEstimator:
         hypothesis = ObjectHypothesisWithPose()
         hypothesis.id = class_id
         hypothesis.pose.pose = pose_msg.pose
-        hypothesis.score = score
+        # hypothesis.score = score
         detections.results.append(hypothesis)
         detections.bbox.center = pose_msg.pose
         detections.bbox.size.x = self.dims[class_id][0] * 2
@@ -598,7 +605,6 @@ if __name__ == '__main__':
 
     pose_estimator = PoseEstimator()
     rospy.spin()
-
 
 
 

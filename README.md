@@ -65,30 +65,44 @@ pip install -U rosdep rosinstall_generator wstool rosinstall six vcstools
 - 6d pose estimation results from AAE + ICP
 
 
-
 ## How to use
-### Single Camera Setup (Kinect Azure)
-1. launch k4a driver
+### Single Camera Setup 
+1. Launch k4a driver
 ```
 $ ROS_NAMESPACE=azure1 roslaunch azure_kinect_ros_driver driver.launch color_resolution:=720P depth_mode:=NFOV_2X2BINNED fps:=5  tf_prefix:=azure1_
 ```
-2. launch k4a manager 
+2. Launch k4a manager 
 ```
-$ roslaunch assembly_camera_manager single_azure_manager.launch target_fiducial_id:="1"
-$ ROS_NAMESPACE=azure1 rosrun image_proc image_proc image_raw:=/azure1/rgb/image_raw camera_info:=/azure1/rgb/camera_info
+$ roslaunch assembly_camera_manager single_azure_manager.launch target_fiducial_id:="0"
 ```
-3. camera to map calibration 
+3. Set camera pose
 ```
-$ rosservice call /azure1/extrinsic_calibration "target_fiducial_ids: [1]"
+$ rosservice call /azure1/set_camera_pose "json_file: 'map_to_azure1_rgb_camera_link_20201102-183839'"
 ```
 4. 6d object pose estimation using MPAAE
 ```
-$ roslaunch assembly_part_recognition single_azure_mpaae.launch yaml:=single_azure_mpaae_SNU
+$ roslaunch assembly_part_recognition single_azure_detr_mpaae.launch yaml:=single_azure_detr_mpaae_GIST
+# in python 3.6
+$ ass36 & python /home/demo/catkin_ws/src/assembly_part_recognition/src/detr_client.py
 ```
 5. visualization using RVIZ
 ```
 rosrun rviz rviz -d single_azure.rviz
 ```
+
+## Multi Camera Setup 
+1. launch k4a driver
+```
+$ ROS_NAMESPACE=azure3 roslaunch azure_kinect_ros_driver driver.launch sensor_sn:=000880594512 wired_sync_mode:=2 subordinate_delay_off_master_usec:=500 fps:=5 color_resolution:=720P depth_mode:=NFOV_2X2BINNED tf_prefix:=azure3_ rgb_point_cloud:=true
+
+$ ROS_NAMESPACE=azure2 roslaunch azure_kinect_ros_driver driver.launch sensor_sn:=000853594412 wired_sync_mode:=2 subordinate_delay_off_master_usec:=250 fps:=5 color_resolution:=720P depth_mode:=NFOV_2X2BINNED tf_prefix:=azure2_ rgb_point_cloud:=true
+
+$ ROS_NAMESPACE=azure1 roslaunch azure_kinect_ros_driver driver.launch sensor_sn:=000256194412 wired_sync_mode:=1 color_resolution:=720P depth_mode:=NFOV_2X2BINNED fps:=5 tf_prefix:=azure1_ rgb_point_cloud:=true
+```
+
+# Calibrate Multi K4a Network
+$ roslaunch assembly_camera_manager triple_azure_manager.launch
+$ rosservice call /triple_azure/extrinsic_calibration "target_fiducial_ids: [1, 3, 13]"
 
 ## Authors
 * **Seunghyeok Back** [seungback](https://github.com/SeungBack)
